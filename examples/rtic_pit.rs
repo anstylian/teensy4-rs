@@ -10,18 +10,21 @@
 use teensy4_bsp as bsp;
 use teensy4_panic as _;
 
-use embedded_hal::timer::CountDown;
 type Timer = bsp::hal::pit::PIT<bsp::hal::pit::channel::_3>;
 
 #[rtic::app(device = teensy4_bsp, peripherals = true)]
-const APP: () = {
+mod app {
+    use super::{bsp, Timer};
+    use embedded_hal::timer::CountDown;
+
+    #[resources]
     struct Resources {
         led: bsp::Led,
         timer: Timer,
     }
 
     #[init]
-    fn init(mut cx: init::Context) -> init::LateResources {
+    fn init(mut cx: init::Context) -> (init::LateResources, init::Monotonics) {
         let (_, ipg_hz) = cx.device.ccm.pll1.set_arm_clock(
             bsp::hal::ccm::PLL1::ARM_HZ,
             &mut cx.device.ccm.handle,
@@ -42,13 +45,18 @@ const APP: () = {
         let mut led = bsp::configure_led(pins.p13);
         led.set();
 
-        init::LateResources { led, timer }
+        (init::LateResources { led, timer }, init::Monotonics())
     }
 
     #[task(binds = PIT, resources = [led, timer])]
     fn blink(cx: blink::Context) {
-        if let Ok(()) = cx.resources.timer.wait() {
-            cx.resources.led.toggle();
-        }
+        let timer = cx.resources.timer;
+        let led = cx.resources.led;
+
+        (timer, led).lock(|timer, led| {
+            if let Ok(()) = timer.wait() {
+                led.toggle();
+            }
+        })
     }
-};
+}

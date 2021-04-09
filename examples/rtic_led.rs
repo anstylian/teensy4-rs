@@ -11,14 +11,14 @@
 #![no_std]
 #![no_main]
 
-use embedded_hal::digital::v2::OutputPin;
-use teensy4_bsp as bsp;
 use teensy4_panic as _;
 
 #[rtic::app(device = teensy4_bsp, peripherals = true)]
-const APP: () = {
+mod app {
+    use teensy4_bsp as bsp;
+
     #[init]
-    fn init(cx: init::Context) {
+    fn init(cx: init::Context) -> (init::LateResources, init::Monotonics) {
         // Cortex-M peripherals
         let _core: cortex_m::Peripherals = cx.core;
 
@@ -26,7 +26,9 @@ const APP: () = {
         let device: bsp::Peripherals = cx.device;
         let pins = bsp::t40::into_pins(device.iomuxc);
         let mut led = bsp::configure_led(pins.p13);
-        led.set_high().unwrap();
+        led.set();
+
+        (init::LateResources {}, init::Monotonics())
     }
     #[idle]
     fn idle(_: idle::Context) -> ! {
@@ -34,4 +36,4 @@ const APP: () = {
             core::hint::spin_loop();
         }
     }
-};
+}

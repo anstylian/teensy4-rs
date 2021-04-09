@@ -16,16 +16,9 @@
 #![no_std]
 #![no_main]
 
-use embedded_hal::digital::v2::OutputPin;
-use embedded_hal::serial::Read;
 use heapless::consts::U256;
-use rtic::cyccnt::U32Ext;
 use teensy4_bsp as bsp;
 use teensy4_panic as _;
-
-const PERIOD: u32 = bsp::hal::ccm::PLL1::ARM_HZ;
-const BAUD: u32 = 115_200;
-const TX_FIFO_SIZE: u8 = 4;
 
 // Type aliases for the Queue we want to use.
 type Ty = u8;
@@ -37,8 +30,23 @@ type Consumer = heapless::spsc::Consumer<'static, Ty, Cap>;
 // The UART receiver.
 type UartRx = bsp::hal::uart::Rx<bsp::hal::iomuxc::consts::U2>;
 
-#[rtic::app(device = teensy4_bsp, monotonic = rtic::cyccnt::CYCCNT, peripherals = true)]
-const APP: () = {
+#[rtic::app(device = teensy4_bsp, peripherals = true, dispatchers = [LPUART8])]
+mod app {
+    use crate::{Consumer, Producer, Queue, UartRx};
+    use embedded_hal::digital::v2::OutputPin;
+    use embedded_hal::serial::Read;
+    use teensy4_bsp as bsp;
+
+    use dwt_systick_monotonic::DwtSystick;
+    use rtic::time::duration::Seconds;
+
+    const BAUD: u32 = 115_200;
+    const TX_FIFO_SIZE: u8 = 4;
+
+    #[monotonic(binds = SysTick, default = true)]
+    type MyMono = DwtSystick<{ bsp::hal::ccm::PLL1::ARM_HZ }>;
+
+    #[resources]
     struct Resources {
         led: bsp::Led,
         u_rx: UartRx,
@@ -46,9 +54,14 @@ const APP: () = {
         q_rx: Consumer,
     }
 
-    #[init(schedule = [blink])]
-    fn init(mut cx: init::Context) -> init::LateResources {
-        cx.core.DWT.enable_cycle_counter();
+    #[init()]
+    fn init(mut cx: init::Context) -> (init::LateResources, init::Monotonics) {
+        let mut dcb = cx.core.DCB;
+        let dwt = cx.core.DWT;
+        let systick = cx.core.SYST;
+
+        let mono = DwtSystick::new(&mut dcb, dwt, systick, bsp::hal::ccm::PLL1::ARM_HZ);
+
         cx.device.ccm.pll1.set_arm_clock(
             bsp::hal::ccm::PLL1::ARM_HZ,
             &mut cx.device.ccm.handle,
@@ -79,18 +92,21 @@ const APP: () = {
         led.set_high().unwrap();
 
         // Schedule the first blink.
-        cx.schedule.blink(cx.start + PERIOD.cycles()).unwrap();
+        blink::spawn_after(Seconds(1_u32)).unwrap();
 
-        init::LateResources {
-            led,
-            q_rx,
-            q_tx,
-            u_rx,
-        }
+        (
+            init::LateResources {
+                led,
+                q_rx,
+                q_tx,
+                u_rx,
+            },
+            init::Monotonics(mono),
+        )
     }
 
-    #[task(resources = [led, q_rx], schedule = [blink])]
-    fn blink(cx: blink::Context) {
+    #[task(resources = [led, q_rx])]
+    fn blink(mut cx: blink::Context) {
         // Log via UART.
         static mut TIMES: u32 = 0;
         *TIMES += 1;
@@ -100,38 +116,37 @@ const APP: () = {
             if *TIMES > 1 { "s" } else { "" }
         );
 
-        // Log all bytes that have been read via UART as a utf8 str.
-        if cx.resources.q_rx.ready() {
-            let mut buffer = [0u8; 256];
-            for elem in buffer.iter_mut() {
-                *elem = match cx.resources.q_rx.dequeue() {
-                    None => break,
-                    Some(b) => b,
-                };
+        cx.resources.q_rx.lock(|q_rx| {
+            if q_rx.ready() {
+                let mut buffer = [0u8; 256];
+                for elem in buffer.iter_mut() {
+                    *elem = match q_rx.dequeue() {
+                        None => break,
+                        Some(b) => b,
+                    };
+                }
+                let s = core::str::from_utf8(&buffer).unwrap();
+                log::info!("read: {}", s);
             }
-            let s = core::str::from_utf8(&buffer).unwrap();
-            log::info!("read: {}", s);
-        }
+        });
 
         // Toggle the LED.
-        cx.resources.led.toggle();
+        cx.resources.led.lock(|led| led.toggle());
 
         // Schedule the following blink.
-        cx.schedule.blink(cx.scheduled + PERIOD.cycles()).unwrap();
+        blink::spawn_after(Seconds(1_u32)).unwrap();
     }
 
     #[task(binds = LPUART2, resources = [u_rx, q_tx])]
     fn lpuart2(cx: lpuart2::Context) {
         log::info!("LPUART2 interrupt task called!");
-        while let Ok(b) = cx.resources.u_rx.read() {
-            cx.resources.q_tx.enqueue(b).ok();
-        }
-    }
+        let u_rx = cx.resources.u_rx;
+        let q_tx = cx.resources.q_tx;
 
-    // RTIC requires that unused interrupts are declared in an extern block when
-    // using software tasks; these free interrupts will be used to dispatch the
-    // software tasks.
-    extern "C" {
-        fn LPUART8();
+        (u_rx, q_tx).lock(|u_rx, q_tx| {
+            while let Ok(b) = u_rx.read() {
+                q_tx.enqueue(b).ok();
+            }
+        });
     }
-};
+}

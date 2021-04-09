@@ -12,29 +12,34 @@
 #![no_std]
 #![no_main]
 
-use bsp::hal::ral::usb::USB1;
-use embedded_hal::digital::v2::OutputPin;
-use rtic::cyccnt::U32Ext;
-use teensy4_bsp as bsp;
 use teensy4_panic as _;
 
-// The CYCCNT counts in clock cycles. Using the clock hz should give us a ~1 second period.
-const PERIOD: u32 = bsp::hal::ccm::PLL1::ARM_HZ;
+#[rtic::app(device = teensy4_bsp, peripherals = true, dispatchers = [LPUART8])]
+mod app {
+    use bsp::hal::ral::usb::USB1;
+    use embedded_hal::digital::v2::OutputPin;
+    use teensy4_bsp as bsp;
 
-#[rtic::app(device = teensy4_bsp, monotonic = rtic::cyccnt::CYCCNT, peripherals = true)]
-const APP: () = {
+    use dwt_systick_monotonic::DwtSystick;
+    use rtic::time::duration::Seconds;
+
+    #[monotonic(binds = SysTick, default = true)]
+    type MyMono = DwtSystick<{ bsp::hal::ccm::PLL1::ARM_HZ }>;
+
+    #[resources]
     struct Resources {
         led: bsp::Led,
         poller: bsp::usb::Poller,
     }
 
-    #[init(schedule = [blink])]
-    fn init(mut cx: init::Context) -> init::LateResources {
-        // Initialise the monotonic CYCCNT timer.
-        cx.core.DWT.enable_cycle_counter();
+    #[init()]
+    fn init(mut cx: init::Context) -> (init::LateResources, init::Monotonics) {
+        let mut dcb = cx.core.DCB;
+        let dwt = cx.core.DWT;
+        let systick = cx.core.SYST;
 
-        // Ensure the ARM clock is configured for the default speed seeing as we use this speed to
-        // determine a 1 second `PERIOD`.
+        let mono = DwtSystick::new(&mut dcb, dwt, systick, bsp::hal::ccm::PLL1::ARM_HZ);
+
         cx.device.ccm.pll1.set_arm_clock(
             bsp::hal::ccm::PLL1::ARM_HZ,
             &mut cx.device.ccm.handle,
@@ -42,7 +47,7 @@ const APP: () = {
         );
 
         // Schedule the first blink.
-        cx.schedule.blink(cx.start + PERIOD.cycles()).unwrap();
+        blink::spawn_after(Seconds(1_u32)).unwrap();
         let pins = bsp::t40::into_pins(cx.device.iomuxc);
         let mut led = bsp::configure_led(pins.p13);
         led.set_high().unwrap();
@@ -50,28 +55,21 @@ const APP: () = {
         // Initialize the USB system
         let (poller, _) = bsp::usb::init(USB1::take().unwrap(), Default::default()).unwrap();
 
-        init::LateResources { led, poller }
+        (init::LateResources { led, poller }, init::Monotonics(mono))
     }
 
-    #[task(resources = [led], schedule = [blink])]
-    fn blink(cx: blink::Context) {
+    #[task(resources = [led])]
+    fn blink(mut cx: blink::Context) {
         static mut COUNTER: u32 = 0;
-        cx.resources.led.toggle();
+        cx.resources.led.lock(|led| led.toggle());
         // Schedule the following blink.
-        cx.schedule.blink(cx.scheduled + PERIOD.cycles()).unwrap();
+        blink::spawn_after(Seconds(1_u32)).unwrap();
         log::info!("Hello from RTIC! Count = {}", *COUNTER);
         *COUNTER += 1;
     }
 
     #[task(binds = USB_OTG1, resources = [poller])]
-    fn usb_otg1(cx: usb_otg1::Context) {
-        cx.resources.poller.poll();
+    fn usb_otg1(mut cx: usb_otg1::Context) {
+        cx.resources.poller.lock(|poller| poller.poll());
     }
-
-    // RTIC requires that unused interrupts are declared in an extern block when
-    // using software tasks; these free interrupts will be used to dispatch the
-    // software tasks.
-    extern "C" {
-        fn LPUART8();
-    }
-};
+}
